@@ -25,14 +25,18 @@
       {
         "from": "scripts",
         "to": "scripts",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "mac": {
       "target": [
         {
           "target": "dmg",
-          "arch": ["arm64"]
+          "arch": [
+            "arm64"
+          ]
         }
       ]
     },
@@ -40,22 +44,21 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     }
   },
   "dependencies": {
     "@electron-toolkit/tsconfig": "^2.0.0",
-    "archiver": "^7.0.1",
-    "exceljs": "^4.4.0",
     "sql.js": "^1.12.0",
     "uuid": "^11.0.5"
   },
   "devDependencies": {
     "@electron-toolkit/preload": "^3.0.1",
     "@electron-toolkit/utils": "^3.0.0",
-    "@types/archiver": "^6.0.3",
     "@types/node": "^22.10.10",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",

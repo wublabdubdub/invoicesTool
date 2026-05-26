@@ -32,6 +32,14 @@ export interface ImportStageProgress {
   skipped: number
 }
 
+export interface DocumentData {
+  base64: string
+  mimeType: string
+  extension: string
+}
+
+const SUPPORTED_INVOICE_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg', '.png'])
+
 function getInvoiceDir(): string {
   const dir = path.join(app.getPath('userData'), 'invoices')
   if (!fs.existsSync(dir)) {
@@ -53,8 +61,25 @@ function hashFile(filePath: string): string {
   return crypto.createHash('md5').update(buffer).digest('hex')
 }
 
-function isPdf(filePath: string): boolean {
-  return path.extname(filePath).toLowerCase() === '.pdf'
+function getSupportedExtension(filePath: string): string | null {
+  const ext = path.extname(filePath).toLowerCase()
+  return SUPPORTED_INVOICE_EXTENSIONS.has(ext) ? ext : null
+}
+
+function isSupportedInvoiceFile(filePath: string): boolean {
+  return getSupportedExtension(filePath) !== null
+}
+
+function getMimeType(extension: string): string {
+  switch (extension.toLowerCase()) {
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg'
+    case '.png':
+      return 'image/png'
+    default:
+      return 'application/pdf'
+  }
 }
 
 function escapeSql(value: string): string {
@@ -72,10 +97,11 @@ export function importPdfs(
   let skipped = 0
   const importedItems: ImportedItem[] = []
   let done = 0
-  const total = srcPaths.filter((p) => isPdf(p)).length
+  const total = srcPaths.filter((p) => isSupportedInvoiceFile(p)).length
 
   for (const srcPath of srcPaths) {
-    if (!isPdf(srcPath)) continue
+    const extension = getSupportedExtension(srcPath)
+    if (!extension) continue
     done++
     try {
       const hash = hashFile(srcPath)
@@ -89,11 +115,11 @@ export function importPdfs(
       }
 
       const id = uuidv4()
-      const fileName = `${id}.pdf`
+      const fileName = `${id}${extension}`
       const destPath = path.join(invoiceDir, fileName)
       fs.copyFileSync(srcPath, destPath)
 
-      const originalName = path.basename(srcPath, '.pdf')
+      const originalName = path.basename(srcPath, path.extname(srcPath))
       const now = new Date().toISOString()
       const normalizedProjectTag = projectTag?.trim() ? projectTag.trim() : null
 
@@ -122,15 +148,20 @@ export function importFolder(
   onProgress?: (progress: ImportStageProgress) => void
 ): ImportResult {
   const files = fs.readdirSync(folderPath)
-  const pdfPaths = files
-    .filter((f) => isPdf(f))
+  const invoicePaths = files
+    .filter((f) => isSupportedInvoiceFile(f))
     .map((f) => path.join(folderPath, f))
-  return importPdfs(pdfPaths, projectTag, onProgress)
+  return importPdfs(invoicePaths, projectTag, onProgress)
 }
 
-export function getPdfBase64(filePath: string): string {
+export function getDocumentData(filePath: string): DocumentData {
+  const extension = path.extname(filePath).toLowerCase()
   const buffer = fs.readFileSync(filePath)
-  return buffer.toString('base64')
+  return {
+    base64: buffer.toString('base64'),
+    mimeType: getMimeType(extension),
+    extension
+  }
 }
 
 export function importInvoiceAttachments(
@@ -150,7 +181,8 @@ export function importInvoiceAttachments(
   const attachments: InvoiceAttachmentItem[] = []
 
   for (const srcPath of srcPaths) {
-    if (!isPdf(srcPath)) continue
+    const extension = getSupportedExtension(srcPath)
+    if (!extension) continue
     try {
       const hash = hashFile(srcPath)
       const duplicate = db.exec(
@@ -164,7 +196,7 @@ export function importInvoiceAttachments(
       }
 
       const id = uuidv4()
-      const destPath = path.join(attachmentDir, `${id}.pdf`)
+      const destPath = path.join(attachmentDir, `${id}${extension}`)
       const sourceName = path.basename(srcPath)
       const createdAt = new Date().toISOString()
 

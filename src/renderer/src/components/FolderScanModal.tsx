@@ -115,8 +115,8 @@ export default function FolderScanModal({
           {scanning && (
             <div className="flex flex-col items-center gap-3 py-8">
               <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              <p className="text-sm text-gray-500">正在递归扫描 PDF 文件...</p>
-              <p className="text-xs text-gray-400">极速模式：优先扫码 + 文本提取（不跑深度识别）</p>
+              <p className="text-sm text-gray-500">正在递归扫描发票文件...</p>
+              <p className="text-xs text-gray-400">极速模式：PDF 优先扫码 + 文本提取，图片直接轻量识别</p>
             </div>
           )}
 
@@ -152,7 +152,7 @@ export default function FolderScanModal({
               <div className="grid grid-cols-4 gap-2">
                 <div className="bg-gray-50 rounded-lg p-3 text-center">
                   <div className="text-xl font-bold text-gray-700">{result.total}</div>
-                  <div className="text-xs text-gray-500 mt-0.5">PDF 文件</div>
+                  <div className="text-xs text-gray-500 mt-0.5">支持文件</div>
                 </div>
                 <div className="bg-blue-50 rounded-lg p-3 text-center">
                   <div className="text-xl font-bold text-blue-700">{result.invoices.length}</div>
@@ -210,7 +210,7 @@ export default function FolderScanModal({
 
               {result.invoices.length === 0 && (
                 <div className="text-center py-4 text-sm text-gray-500">
-                  未在该目录下找到发票 PDF
+                  未在该目录下找到发票文件
                 </div>
               )}
 

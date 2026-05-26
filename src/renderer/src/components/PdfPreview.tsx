@@ -13,11 +13,17 @@ const ZOOM_STEP = 0.25
 const ZOOM_MIN = 0.5
 const ZOOM_MAX = 3
 
+type DocumentData = {
+  base64: string
+  mimeType: string
+  extension: string
+}
+
 export default function PdfPreview(): React.JSX.Element {
   const { invoices, activeInvoiceId } = useInvoiceStore()
   const invoice = invoices.find((i) => i.id === activeInvoiceId) || null
 
-  const [pdfData, setPdfData] = useState<string | null>(null)
+  const [documentData, setDocumentData] = useState<DocumentData | null>(null)
   const [numPages, setNumPages] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [loading, setLoading] = useState(false)
@@ -47,17 +53,18 @@ export default function PdfPreview(): React.JSX.Element {
 
   useEffect(() => {
     if (!invoice) {
-      setPdfData(null)
+      setDocumentData(null)
       return
     }
     setLoading(true)
     setCurrentPage(1)
+    setNumPages(0)
     setZoom(1)
-    window.api.getPdfData(invoice.filePath).then((base64: string) => {
-      setPdfData(base64)
+    window.api.getPdfData(invoice.filePath).then((data: DocumentData) => {
+      setDocumentData(data)
       setLoading(false)
     }).catch(() => {
-      setPdfData(null)
+      setDocumentData(null)
       setLoading(false)
     })
   }, [invoice?.id])
@@ -96,7 +103,7 @@ export default function PdfPreview(): React.JSX.Element {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
             d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
         </svg>
-        <p className="text-sm">选择发票预览 PDF</p>
+        <p className="text-sm">选择发票预览文件</p>
       </div>
     )
   }
@@ -109,16 +116,18 @@ export default function PdfPreview(): React.JSX.Element {
     )
   }
 
-  if (!pdfData) {
+  if (!documentData) {
     return (
       <div className="flex flex-col items-center justify-center h-full bg-gray-50 text-gray-400">
-        <p className="text-sm">无法加载 PDF</p>
+        <p className="text-sm">无法加载发票文件</p>
         <p className="text-xs mt-1">{invoice.filePath}</p>
       </div>
     )
   }
 
   const pageWidth = Math.floor(containerWidth * zoom)
+  const dataUrl = `data:${documentData.mimeType};base64,${documentData.base64}`
+  const isPdf = documentData.mimeType === 'application/pdf'
 
   return (
     <div className="flex flex-col h-full bg-gray-100">
@@ -187,7 +196,7 @@ export default function PdfPreview(): React.JSX.Element {
         </div>
       </div>
 
-      {/* PDF content */}
+      {/* Document content */}
       <div
         id="pdf-scroll-area"
         ref={containerRef}
@@ -196,23 +205,34 @@ export default function PdfPreview(): React.JSX.Element {
         onMouseDown={onMouseDown}
       >
         <div style={{ minWidth: 'fit-content', margin: '0 auto', width: 'fit-content' }}>
-        <Document
-          file={`data:application/pdf;base64,${pdfData}`}
-          onLoadSuccess={({ numPages }) => setNumPages(numPages)}
-          loading={
-            <div className="flex items-center justify-center p-8">
-              <div className="w-6 h-6 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin" />
-            </div>
-          }
-        >
-          <Page
-            pageNumber={currentPage}
-            width={pageWidth}
-            renderAnnotationLayer={true}
-            renderTextLayer={true}
-            className="shadow-md"
-          />
-        </Document>
+          {isPdf ? (
+            <Document
+              file={dataUrl}
+              onLoadSuccess={({ numPages }) => setNumPages(numPages)}
+              loading={
+                <div className="flex items-center justify-center p-8">
+                  <div className="w-6 h-6 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin" />
+                </div>
+              }
+            >
+              <Page
+                pageNumber={currentPage}
+                width={pageWidth}
+                renderAnnotationLayer={true}
+                renderTextLayer={true}
+                className="shadow-md"
+              />
+            </Document>
+          ) : (
+            <img
+              src={dataUrl}
+              alt="发票预览"
+              className="shadow-md bg-white block"
+              draggable={false}
+              style={{ width: pageWidth, maxWidth: 'none' }}
+              onLoad={() => setNumPages(1)}
+            />
+          )}
         </div>
       </div>
     </div>

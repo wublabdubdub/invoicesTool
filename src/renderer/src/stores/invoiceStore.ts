@@ -17,6 +17,8 @@ interface InvoiceStore {
   settings: AppSettings
   filter: FilterState
   loading: boolean
+  manualOcrLoading: Set<string>
+  backgroundOcrLoading: Set<string>
   ocrLoading: Set<string>
   batchOcrProgress: { done: number; total: number } | null
 
@@ -35,6 +37,12 @@ interface InvoiceStore {
   saveSettings: (settings: Partial<AppSettings>) => Promise<void>
   runOcr: (invoice: Invoice) => Promise<void>
   runOcrBatch: () => Promise<void>
+  refreshBackgroundOcrStatus: () => Promise<void>
+  applyBackgroundOcrStatus: (activeIds: string[], completedId?: string) => Promise<void>
+}
+
+function mergeLoadingSets(manual: Set<string>, background: Set<string>): Set<string> {
+  return new Set([...manual, ...background])
 }
 
 export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
@@ -42,9 +50,11 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
   selectedIds: new Set(),
   activeInvoiceId: null,
   projects: [],
-  settings: { pythonPath: '', dataDir: '', exporterName: '', companyName: '' },
+  settings: { pythonPath: '', dataDir: '' },
   filter: { search: '', category: '', projectTag: '', startDate: '', endDate: '' },
   loading: false,
+  manualOcrLoading: new Set(),
+  backgroundOcrLoading: new Set(),
   ocrLoading: new Set(),
   batchOcrProgress: null,
 
@@ -71,9 +81,7 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
     set({
       settings: {
         pythonPath: raw.pythonPath || '',
-        dataDir: raw.dataDir || '',
-        exporterName: raw.exporterName || '',
-        companyName: raw.companyName || ''
+        dataDir: raw.dataDir || ''
       }
     })
   },
@@ -139,7 +147,13 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
   },
 
   runOcr: async (invoice) => {
-    set((s) => ({ ocrLoading: new Set([...s.ocrLoading, invoice.id]) }))
+    set((s) => {
+      const manualOcrLoading = new Set([...s.manualOcrLoading, invoice.id])
+      return {
+        manualOcrLoading,
+        ocrLoading: mergeLoadingSets(manualOcrLoading, s.backgroundOcrLoading)
+      }
+    })
 
     const result = await window.api.runOcr(invoice.filePath)
 
@@ -164,9 +178,12 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
     // 必须在 updateInvoice 之后再移除 loading，
     // 这样 EditPanel 的 useEffect([isOcrLoading]) 触发时已能读到最新数据
     set((s) => {
-      const next = new Set(s.ocrLoading)
-      next.delete(invoice.id)
-      return { ocrLoading: next }
+      const manualOcrLoading = new Set(s.manualOcrLoading)
+      manualOcrLoading.delete(invoice.id)
+      return {
+        manualOcrLoading,
+        ocrLoading: mergeLoadingSets(manualOcrLoading, s.backgroundOcrLoading)
+      }
     })
   },
 
@@ -187,7 +204,13 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
       const batch = targets.slice(i, i + CONCURRENCY)
       await Promise.all(
         batch.map(async (invoice) => {
-          set((s) => ({ ocrLoading: new Set([...s.ocrLoading, invoice.id]) }))
+          set((s) => {
+            const manualOcrLoading = new Set([...s.manualOcrLoading, invoice.id])
+            return {
+              manualOcrLoading,
+              ocrLoading: mergeLoadingSets(manualOcrLoading, s.backgroundOcrLoading)
+            }
+          })
 
           const result = await window.api.runOcr(invoice.filePath)
 
@@ -210,9 +233,12 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
           }
 
           set((s) => {
-            const next = new Set(s.ocrLoading)
-            next.delete(invoice.id)
-            return { ocrLoading: next }
+            const manualOcrLoading = new Set(s.manualOcrLoading)
+            manualOcrLoading.delete(invoice.id)
+            return {
+              manualOcrLoading,
+              ocrLoading: mergeLoadingSets(manualOcrLoading, s.backgroundOcrLoading)
+            }
           })
 
           done++
@@ -225,6 +251,22 @@ export const useInvoiceStore = create<InvoiceStore>((set, get) => ({
 
     if (failures.length) {
       alert(`批量识别完成，${total - failures.length} 张成功，${failures.length} 张失败：\n${failures.join('\n')}`)
+    }
+  },
+
+  refreshBackgroundOcrStatus: async () => {
+    const status = await window.api.getBackgroundOcrStatus()
+    await get().applyBackgroundOcrStatus(status.activeIds, status.completedId)
+  },
+
+  applyBackgroundOcrStatus: async (activeIds, completedId) => {
+    const backgroundOcrLoading = new Set(activeIds)
+    set((s) => ({
+      backgroundOcrLoading,
+      ocrLoading: mergeLoadingSets(s.manualOcrLoading, backgroundOcrLoading)
+    }))
+    if (completedId) {
+      await get().loadInvoices()
     }
   }
 }))

@@ -50,7 +50,6 @@ export default function SettingsModal({ onClose }: Props): React.JSX.Element {
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-5">
-          {/* Python path */}
           <section>
             <h3 className="text-sm font-semibold text-gray-700 mb-3">OCR 设置（本地 Python）</h3>
             <p className="text-xs text-gray-500 mb-2">
@@ -75,9 +74,9 @@ export default function SettingsModal({ onClose }: Props): React.JSX.Element {
                   const result = await window.api.runOcr('__test__')
                   setTesting(false)
                   if (result.error?.includes('无法启动') || result.error?.includes('No module')) {
-                    setTestResult(`❌ ${result.error}`)
+                    setTestResult(`失败：${result.error}`)
                   } else {
-                    setTestResult('✅ Python 环境正常')
+                    setTestResult('Python 环境正常')
                   }
                 }}
                 disabled={testing}
@@ -91,34 +90,6 @@ export default function SettingsModal({ onClose }: Props): React.JSX.Element {
             )}
           </section>
 
-          {/* Report settings */}
-          <section>
-            <h3 className="text-sm font-semibold text-gray-700 mb-3">报销单信息</h3>
-            <div className="flex flex-col gap-2">
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">报销人姓名</label>
-                <input
-                  type="text"
-                  value={form.exporterName}
-                  onChange={(e) => setForm((f) => ({ ...f, exporterName: e.target.value }))}
-                  placeholder="姓名"
-                  className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">公司名称</label>
-                <input
-                  type="text"
-                  value={form.companyName}
-                  onChange={(e) => setForm((f) => ({ ...f, companyName: e.target.value }))}
-                  placeholder="公司名称"
-                  className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-            </div>
-          </section>
-
-          {/* Projects */}
           <section>
             <h3 className="text-sm font-semibold text-gray-700 mb-3">出差项目标签</h3>
             <div className="flex gap-2 mb-2">
@@ -144,14 +115,14 @@ export default function SettingsModal({ onClose }: Props): React.JSX.Element {
               </button>
             </div>
             <div className="flex flex-col gap-1">
-              {projects.map((p) => (
-                <div key={p.id} className="flex items-center justify-between py-1.5 px-2 bg-gray-50 rounded-lg">
+              {projects.map((project) => (
+                <div key={project.id} className="flex items-center justify-between py-1.5 px-2 bg-gray-50 rounded-lg">
                   <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full" style={{ backgroundColor: p.color }} />
-                    <span className="text-sm text-gray-700">{p.name}</span>
+                    <span className="w-3 h-3 rounded-full" style={{ backgroundColor: project.color }} />
+                    <span className="text-sm text-gray-700">{project.name}</span>
                   </div>
                   <button
-                    onClick={() => handleDeleteProject(p.id)}
+                    onClick={() => handleDeleteProject(project.id)}
                     className="text-gray-400 hover:text-red-500 transition-colors"
                   >
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

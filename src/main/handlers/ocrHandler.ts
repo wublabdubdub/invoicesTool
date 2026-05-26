@@ -7,6 +7,7 @@ const SCRIPT_PATH = app.isPackaged
   : path.join(app.getAppPath(), 'scripts', 'ocr.py')
 
 type OcrResult = { success: boolean; data?: Record<string, unknown>; error?: string }
+export type RunOcrOptions = { deepOcr?: boolean; timeoutMs?: number; enrichImageSeller?: boolean }
 type PendingResolver = (result: OcrResult) => void
 
 // ---------------------------------------------------------------------------
@@ -128,8 +129,11 @@ export function stopOcrProcess(): void {
     proc = null
     ready = false
     buffer = ''
-    pending.clear()
   }
+  for (const [, resolver] of pending) {
+    resolver({ success: false, error: 'OCR 进程已重启，请重试' })
+  }
+  pending.clear()
 }
 
 export function cancelScanProcess(): void {
@@ -203,15 +207,16 @@ export function scanFolder(
   })
 }
 
-export async function runOcr(filePath: string): Promise<OcrResult> {
-  // Special "test" invocation from settings page
-  if (filePath === '__test__') {
-    try {
-      await ensureReady()
-      return { success: true }
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) }
-    }
+export async function runOcr(
+  filePath: string,
+  pythonPathOrOptions?: string | RunOcrOptions,
+  maybeOptions?: RunOcrOptions
+): Promise<OcrResult> {
+  let options: RunOcrOptions = maybeOptions || {}
+  if (typeof pythonPathOrOptions === 'string') {
+    setPythonPath(pythonPathOrOptions)
+  } else if (pythonPathOrOptions) {
+    options = pythonPathOrOptions
   }
 
   try {
@@ -227,7 +232,12 @@ export async function runOcr(filePath: string): Promise<OcrResult> {
     const id = String(++reqCounter)
     pending.set(id, resolve)
 
-    const req = JSON.stringify({ id, path: filePath }) + '\n'
+    const req = JSON.stringify({
+      id,
+      path: filePath,
+      deep_ocr: Boolean(options.deepOcr),
+      enrich_image_seller: options.enrichImageSeller !== false
+    }) + '\n'
     proc!.stdin.write(req)
 
     // Per-request timeout (30s per invoice)
@@ -235,7 +245,8 @@ export async function runOcr(filePath: string): Promise<OcrResult> {
       if (pending.has(id)) {
         pending.delete(id)
         resolve({ success: false, error: '识别超时（30s），发票可能过于复杂' })
+        stopOcrProcess()
       }
-    }, 30_000)
+    }, options.timeoutMs ?? 30_000)
   })
 }

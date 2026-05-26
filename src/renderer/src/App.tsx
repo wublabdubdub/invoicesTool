@@ -7,17 +7,17 @@ import EditPanel from './components/EditPanel'
 import ResizeHandle from './components/ResizeHandle'
 import { useInvoiceStore } from './stores/invoiceStore'
 
-const FILTER_MIN = 140
-const FILTER_MAX = 360
+const FILTER_MIN = 320
+const FILTER_MAX = 560
 const LIST_MIN = 200
 const LIST_MAX = 480
 const EDIT_MIN = 220
 const EDIT_MAX = 480
 
 export default function App(): React.JSX.Element {
-  const { loadInvoices, loadProjects, loadSettings } = useInvoiceStore()
+  const { loadInvoices, loadProjects, loadSettings, refreshBackgroundOcrStatus, applyBackgroundOcrStatus } = useInvoiceStore()
 
-  const [filterWidth, setFilterWidth] = useState(192)
+  const [filterWidth, setFilterWidth] = useState(448)
   const [listWidth, setListWidth] = useState(288)
   const [editWidth, setEditWidth] = useState(288)
 
@@ -25,7 +25,14 @@ export default function App(): React.JSX.Element {
     loadSettings()
     loadProjects()
     loadInvoices()
+    refreshBackgroundOcrStatus()
   }, [])
+
+  useEffect(() => {
+    return window.api.onBackgroundOcrStatus((status) => {
+      applyBackgroundOcrStatus(status.activeIds, status.completedId)
+    })
+  }, [applyBackgroundOcrStatus])
 
   const resizeFilter = useCallback((delta: number) => {
     setFilterWidth((w) => Math.min(FILTER_MAX, Math.max(FILTER_MIN, w + delta)))
@@ -57,7 +64,7 @@ export default function App(): React.JSX.Element {
 
         <ResizeHandle onResize={resizeList} />
 
-        {/* PDF preview */}
+        {/* Invoice file preview */}
         <div className="flex-1 min-w-0">
           <PdfPreview />
         </div>

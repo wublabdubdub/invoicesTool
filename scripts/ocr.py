@@ -18,12 +18,32 @@ import json
 import re
 import os
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
 warnings.filterwarnings('ignore')
 
 _MAX_MONEY_VALUE = 1_000_000_000.0
+_PDF_OCR_RENDER_SCALE = 1.0
+_PDF_EXTENSIONS = {'.pdf'}
+_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
+_SUPPORTED_DOCUMENT_EXTENSIONS = _PDF_EXTENSIONS | _IMAGE_EXTENSIONS
+
+
+def is_pdf_file(file_path):
+    return os.path.splitext(file_path)[1].lower() in _PDF_EXTENSIONS
+
+
+def is_image_file(file_path):
+    return os.path.splitext(file_path)[1].lower() in _IMAGE_EXTENSIONS
+
+
+def is_supported_document(file_path):
+    return os.path.splitext(file_path)[1].lower() in _SUPPORTED_DOCUMENT_EXTENSIONS
 
 
 def parse_money(raw):
@@ -84,6 +104,41 @@ def extract_qr_from_pdf(pdf_path, max_pages=1):
         return []
 
 
+def read_image_rgb(image_path):
+    """Unicode-safe image loading for OpenCV on Windows."""
+    import numpy as np
+    import cv2
+
+    data = np.fromfile(image_path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def extract_qr_from_image(image_path):
+    """用 OpenCV 从图片发票中提取 QR 码文本。失败时静默返回空列表。"""
+    try:
+        import cv2
+
+        img = read_image_rgb(image_path)
+        if img is None:
+            return []
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        data, _, _ = cv2.QRCodeDetector().detectAndDecode(gray)
+        return [data.strip()] if data else []
+    except Exception:
+        return []
+
+
+def extract_qr_codes(file_path, max_pages=1):
+    if is_pdf_file(file_path):
+        return extract_qr_from_pdf(file_path, max_pages=max_pages)
+    if is_image_file(file_path):
+        return extract_qr_from_image(file_path)
+    return []
+
+
 def parse_invoice_qr(qr_text):
     """
     解析中国增值税电子发票 QR 码。
@@ -124,6 +179,14 @@ def parse_invoice_qr(qr_text):
                 result['tax'] = tax
 
     return result
+
+
+def is_qr_confident(fields):
+    """QR is enough for fast import when it identifies the invoice and date or total."""
+    return bool(
+        fields.get('invoice_no')
+        and (fields.get('total') is not None or fields.get('date') is not None)
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +231,7 @@ def get_ocr():
         from paddleocr import PaddleOCR
         _ocr = PaddleOCR(
             lang='ch',
+            enable_mkldnn=False,
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
@@ -175,14 +239,14 @@ def get_ocr():
     return _ocr
 
 
-def pdf_to_images(pdf_path, max_pages=2):
+def pdf_to_images(pdf_path, max_pages=2, scale=_PDF_OCR_RENDER_SCALE):
     import fitz, numpy as np
     doc = fitz.open(pdf_path)
     images = []
     for i, page in enumerate(doc):
         if i >= max_pages:
             break
-        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
             pix.height, pix.width, pix.n
         )
@@ -191,6 +255,19 @@ def pdf_to_images(pdf_path, max_pages=2):
         images.append(img)
     doc.close()
     return images
+
+
+def image_to_images(image_path):
+    img = read_image_rgb(image_path)
+    return [img] if img is not None else []
+
+
+def document_to_images(file_path, max_pages=2):
+    if is_pdf_file(file_path):
+        return pdf_to_images(file_path, max_pages=max_pages)
+    if is_image_file(file_path):
+        return image_to_images(file_path)
+    return []
 
 
 def run_ocr(images):
@@ -205,12 +282,117 @@ def run_ocr(images):
     return lines
 
 
+def image_seller_region_to_images(image_path):
+    img = read_image_rgb(image_path)
+    if img is None:
+        return []
+
+    h, w = img.shape[:2]
+    regions = [
+        (0.52, 0.18, 0.99, 0.55),
+        (0.60, 0.25, 0.98, 0.42),
+        (0.02, 0.18, 0.99, 0.50),
+    ]
+    crops = []
+    for x1, y1, x2, y2 in regions:
+        left, top = int(w * x1), int(h * y1)
+        right, bottom = int(w * x2), int(h * y2)
+        crop = img[top:bottom, left:right]
+        if crop.size:
+            crops.append(crop)
+    return crops
+
+
+def extract_image_seller_fields_fast(image_path):
+    """Run OCR only on likely seller-info crops for image invoices."""
+    lines = []
+    for crop in image_seller_region_to_images(image_path):
+        lines = run_ocr([crop])
+        fields = extract_seller_fields_from_lines(lines, allow_single_name=True)
+        if fields.get('vendor'):
+            fields['_ocr_lines'] = lines
+            return fields
+
+    return {'vendor': None, 'vendor_tax_id': None, '_ocr_lines': lines}
+
+
+def extract_seller_fields_from_lines(lines, allow_single_name=False):
+    text = '\n'.join(lines)
+    tax_id_re = re.compile(r'^[0-9A-Z]{18}$')
+    suffixes = (
+        '公司|店|厂|局|院|馆|酒店|餐厅|饭店|超市|银行|科技|集团|服务|餐饮'
+        '|铺|社|所|中心|部|站|处|坊|园|场|网络|贸易|商贸|工作室|诊所|药店'
+    )
+    company_re = re.compile(rf'[\u4e00-\u9fffA-Za-z0-9（）()·]{{2,50}}(?:{suffixes})[\u4e00-\u9fffA-Za-z0-9（）()·]{{0,12}}')
+
+    def clean_vendor(value):
+        value = re.sub(r'^(?:名\s*)?称[：:：]?', '', value.strip())
+        value = value.strip().rstrip('，,。.')
+        if not value or re.match(r'^[\s：:]*$', value):
+            return None
+        if '：' in value or ':' in value:
+            return None
+        label_tokens = (
+            '统一社会信用代码', '纳税人识别号', '识别号', '税号',
+            '名称', '地址', '电话', '开户行', '账号'
+        )
+        if any(tok in value for tok in label_tokens):
+            return None
+        if not re.search(r'[\u4e00-\u9fff]', value):
+            return None
+        match = company_re.search(value)
+        return match.group(0) if match else value
+
+    inline_names = [
+        clean_vendor(m.group(1))
+        for m in re.finditer(r'(?:名\s*)?称[：:]\s*([^\n：:]{2,60})', text)
+    ]
+    inline_names = [v for v in inline_names if v]
+    vendor = None
+    if len(inline_names) >= 2:
+        vendor = inline_names[1]
+    elif allow_single_name and len(inline_names) == 1:
+        vendor = inline_names[0]
+
+    if not vendor:
+        candidates = []
+        for line in lines:
+            if tax_id_re.match(line):
+                continue
+            if re.search(r'[%％¥￥\d]{3,}', line):
+                continue
+            for match in company_re.finditer(line):
+                candidate = clean_vendor(match.group(0))
+                if candidate:
+                    candidates.append(candidate)
+        if len(candidates) >= 2:
+            vendor = candidates[1]
+        elif allow_single_name and candidates:
+            vendor = candidates[-1]
+
+    vendor_tax_id = None
+    if not allow_single_name:
+        inline_tax_ids = re.findall(
+            r'(?:统一社会信用代码|纳税人识别号)[/／\w]*[：:]\s*([0-9A-Z]{18})',
+            text
+        )
+        if len(inline_tax_ids) >= 2:
+            vendor_tax_id = inline_tax_ids[1]
+        else:
+            standalone = [line for line in lines if tax_id_re.match(line)]
+            if len(standalone) >= 2:
+                vendor_tax_id = standalone[1]
+
+    return {'vendor': vendor, 'vendor_tax_id': vendor_tax_id}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 字段提取（从文本行中解析结构化字段）
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_fields(lines):
     text = '\n'.join(lines)
+    normalized_text = text.replace(' ', '').replace('\t', '')
 
     def _extract_line_money_values(line):
         values = []
@@ -230,6 +412,116 @@ def extract_fields(lines):
             if m:
                 return f'{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}'
         return None
+
+    def _looks_like_air_ticket_invoice():
+        return (
+            '航空运输电子客票行程单' in normalized_text
+            or ('电子客票' in normalized_text and ('承运人' in normalized_text or '航班号' in normalized_text))
+            or ('民航发展基金' in normalized_text and ('客票' in normalized_text or '航班' in normalized_text))
+        )
+
+    def _extract_nearby_money(label):
+        label_re = re.escape(label)
+        for idx, line in enumerate(lines):
+            if label not in line:
+                continue
+            window = ' '.join(lines[idx: idx + 3])
+            m = re.search(
+                rf'{label_re}[^\d\n]{{0,80}}(?:CNY|RMB|人民币|¥|￥)?\s*([\d,，]+(?:\.\d{{1,2}})?)',
+                window,
+                re.IGNORECASE
+            )
+            if m:
+                money = parse_money(m.group(1))
+                if money is not None:
+                    return money
+        return None
+
+    def _extract_air_ticket_date():
+        for pat in [
+            r'填开日期[：:]?\s*(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})',
+            r'开具日期[：:]?\s*(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})',
+        ]:
+            m = re.search(pat, text)
+            if m:
+                return f'{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}'
+        return None
+
+    def _extract_air_ticket_vendor():
+        def clean_air_vendor(value):
+            value = value.strip()
+            value = re.split(r'\s{2,}|填开日期|销售网点|购买方|统一社会信用代码', value)[0].strip(' ：:,，。')
+            label_tokens = (
+                '旅客姓名', '有效身份证件号码', '签注', '承运人', '航班号', '座位等级',
+                '日期', '时间', '客票级别', '票价', '燃油附加费', '增值税',
+                '民航发展基金', '其他税费', '合计', '电子客票号码', '验证码'
+            )
+            if not value or any(token in value for token in label_tokens):
+                return None
+            if not re.search(r'[\u4e00-\u9fff]', value):
+                return None
+            return value
+
+        for pat in [
+            r'(?:填开单位|开单位|开具单位)[：:]?[ \t]*([^\n]{2,60})',
+            r'承运人[：:][ \t]*([^\n]{2,40})',
+        ]:
+            m = re.search(pat, text)
+            if m:
+                value = clean_air_vendor(m.group(1))
+                if value:
+                    return value
+        return None
+
+    def _extract_air_ticket_money_values(segment):
+        values = []
+        for line in segment.splitlines():
+            if re.search(r'\d+(?:\.\d+)?\s*%', line):
+                continue
+            for raw in re.findall(r'(?<!\d)(\d[\d,，]*(?:\.\d{1,2})?)(?!\d)', line):
+                money = parse_money(raw)
+                if money is not None:
+                    values.append(money)
+        return values
+
+    def _extract_air_ticket_money_map():
+        start = None
+        for idx, line in enumerate(lines):
+            if '票价' in line:
+                start = idx
+                break
+        if start is None:
+            return {}
+
+        end = min(len(lines), start + 40)
+        for idx in range(start + 1, end):
+            if any(marker in lines[idx] for marker in ['电子客票号码', '验证码', '提示信息', '保险费']):
+                end = idx
+                break
+
+        segment = '\n'.join(lines[start:end])
+        labels = []
+        for label in ['票价', '燃油附加费', '增值税税额', '民航发展基金', '其他税费', '合计']:
+            pos = segment.find(label)
+            if pos >= 0:
+                labels.append((pos, label))
+        labels.sort()
+
+        values = _extract_air_ticket_money_values(segment)
+        result = {}
+
+        if len(values) >= 6:
+            standard_labels = ['票价', '燃油附加费', '增值税税额', '民航发展基金', '其他税费', '合计']
+            result.update({label: values[idx] for idx, label in enumerate(standard_labels)})
+            return result
+
+        for idx, (_, label) in enumerate(labels):
+            if idx < len(values):
+                result[label] = values[idx]
+
+        if values:
+            result.setdefault('合计', max(values))
+        return result
 
     # 发票号码
     invoice_no = None
@@ -271,6 +563,7 @@ def extract_fields(lines):
     date = None
     for pat in [
         r'开票日期[：:]\s*(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})',
+        r'填开日期[：:]?\s*(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})',
         r'日\s*期[：:]\s*(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})',
         r'(\d{4})[年\-/](\d{1,2})[月\-/](\d{1,2})[日号]',
     ]:
@@ -537,12 +830,35 @@ def extract_fields(lines):
     if total is not None and amount is not None and amount > total:
         amount = None
 
+    is_air_ticket_invoice = _looks_like_air_ticket_invoice()
+    if is_air_ticket_invoice:
+        air_money = _extract_air_ticket_money_map()
+
+        air_date = _extract_air_ticket_date()
+        if air_date:
+            date = air_date
+
+        air_vendor = _extract_air_ticket_vendor()
+        if air_vendor:
+            vendor = air_vendor
+
+        air_total = air_money.get('合计') or _extract_nearby_money('合计')
+        if air_total is not None:
+            total = air_total
+
+        air_tax = air_money.get('增值税税额') or _extract_nearby_money('增值税税额') or _extract_nearby_money('税额')
+        if air_tax is not None:
+            tax = air_tax
+
+        if total is not None and tax is not None:
+            amount = round(total - tax, 2)
+
     # 发票类型
     invoice_type = '其他'
     for t, kws in [
         ('增值税专用发票', ['增值税专用发票', '专用发票']),
         ('增值税普通发票', ['增值税普通发票', '普通发票', '电子普通发票', '电子发票']),
-        ('行程单',       ['行程单', '机票', '火车票', '高铁', '航空']),
+        ('行程单',       ['行程单', '机票', '火车票', '高铁', '航空', '电子客票']),
         ('酒店发票',     ['住宿', '酒店', '宾馆', '客房', '房费']),
         ('出租车票',     ['出租车', '打车', '滴滴', '快车', '网约车', '的士']),
     ]:
@@ -550,16 +866,28 @@ def extract_fields(lines):
             invoice_type = t
             break
 
+    if is_air_ticket_invoice:
+        invoice_type = '行程单'
+
+    def _vendor_startswith(value, prefix):
+        if not value:
+            return False
+        normalized = re.sub(r'\s+', '', value)
+        return normalized.startswith(prefix)
+
     # 费用分类（四类，优先级从高到低）
     category = '餐饮外卖'
     for cat, kws in [
-        ('城市间交通', ['机票', '火车票', '高铁', '铁路', '行程单', '电子客票', '铁路电子客票']),
+        ('城市间交通', ['机票', '火车票', '高铁', '铁路', '行程单', '电子客票', '铁路电子客票', '航空运输', '航班号', '民航发展基金']),
         ('打车',     ['出租车', '滴滴', '打车', '地铁', '公交', '快车', '网约车', '旅客运输']),
         ('住宿',     ['住宿', '酒店', '宾馆', '客房', '民宿', '房费']),
     ]:
         if any(kw in text for kw in kws):
             category = cat
             break
+
+    if any(_vendor_startswith(vendor, prefix) for prefix in ('上海蒜芽科技', '上海蒜芽信息科技')):
+        category = '城市间交通'
 
     return {
         'invoice_no': invoice_no,
@@ -578,28 +906,65 @@ def extract_fields(lines):
 # 主处理逻辑：三层合并
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process(pdf_path):
+def process(file_path, deep_ocr=False, enrich_image_seller=True):
     sources = []
 
     # ── 第一层：QR 码 ──────────────────────────────────────────────────────
     qr_fields = {}
-    for qr_text in extract_qr_from_pdf(pdf_path):
+    for qr_text in extract_qr_codes(file_path):
         parsed = parse_invoice_qr(qr_text)
         qr_fields.update({k: v for k, v in parsed.items() if v is not None})
     if qr_fields:
         sources.append('qr')
 
     # ── 第二层：PDF 文本提取 ────────────────────────────────────────────────
-    lines, is_text_based = extract_text_from_pdf(pdf_path)
+    if is_pdf_file(file_path):
+        lines, is_text_based = extract_text_from_pdf(file_path)
+    else:
+        lines, is_text_based = [], False
 
     if is_text_based:
         text_fields = extract_fields(lines)
         sources.append('text')
     else:
+        if enrich_image_seller and is_image_file(file_path) and is_qr_confident(qr_fields):
+            seller_fields = extract_image_seller_fields_fast(file_path)
+            if seller_fields.get('vendor'):
+                text_fields = extract_fields([])
+                result = text_fields.copy()
+                for key in ('invoice_no', 'total', 'date', 'amount', 'tax'):
+                    if qr_fields.get(key) is not None:
+                        result[key] = qr_fields[key]
+                result['vendor'] = seller_fields['vendor']
+                if seller_fields.get('vendor_tax_id'):
+                    result['vendor_tax_id'] = seller_fields['vendor_tax_id']
+                result['_source'] = '+'.join(sources + ['seller_crop'])
+                result['_ocr_lines'] = seller_fields.get('_ocr_lines', [])
+                return result
+
+        if not deep_ocr:
+            text_fields = extract_fields([])
+            sources.append('qr_fast' if is_qr_confident(qr_fields) else 'ocr_skipped')
+            result = text_fields.copy()
+            for key in ('invoice_no', 'total', 'date', 'amount', 'tax'):
+                if qr_fields.get(key) is not None:
+                    result[key] = qr_fields[key]
+            result['_source'] = '+'.join(sources)
+            if '_ocr_lines' not in result:
+                result['_ocr_lines'] = []
+            return result
+
         # ── 第三层：OCR（扫描件兜底）─────────────────────────────────────
-        lines = run_ocr(pdf_to_images(pdf_path))
-        text_fields = extract_fields(lines)
-        sources.append('ocr')
+        try:
+            lines = run_ocr(document_to_images(file_path, max_pages=1))
+            text_fields = extract_fields(lines)
+            sources.append('ocr')
+        except Exception:
+            if not qr_fields:
+                raise
+            lines = []
+            text_fields = extract_fields(lines)
+            sources.append('qr_only')
 
     # ── 合并：QR 字段优先（最可靠），其余用文本/OCR 补充 ──────────────────
     # QR 提供：invoice_no、total、date、amount、tax
@@ -632,11 +997,13 @@ def process(pdf_path):
 _SCAN_STRONG_KEYWORDS = [
     '发票代码', '发票号码', '开票日期', '价税合计', '纳税人识别号',
     '统一社会信用代码', '销售方', '购买方', '增值税',
+    '航空运输电子客票行程单',
 ]
 
 _SCAN_WEAK_KEYWORDS = [
     '电子发票', '普通发票', '专用发票', '税务总局', '行程单',
     '电子客票', '铁路', '票价', '酒店', '出租车',
+    '航班号', '承运人', '民航发展基金', '填开单位',
 ]
 
 _TRIP_ITINERARY_KEYWORDS = [
@@ -674,23 +1041,30 @@ def _looks_like_trip_itinerary(text):
     return itinerary_hits >= 2 and ride_hits >= 1
 
 
-def _scan_with_qr(pdf_path, mode='balanced'):
+def _scan_with_qr(file_path, mode='balanced'):
     qr_fields = {}
-    for qr_text in extract_qr_from_pdf(pdf_path, max_pages=1):
+    for qr_text in extract_qr_codes(file_path, max_pages=1):
         parsed = parse_invoice_qr(qr_text)
         qr_fields.update({k: v for k, v in parsed.items() if v is not None})
 
     # 常见可靠组合：有发票号 + (金额或日期)
-    qr_confident = bool(
-        qr_fields.get('invoice_no')
-        and (qr_fields.get('total') is not None or qr_fields.get('date') is not None)
-    )
+    qr_confident = is_qr_confident(qr_fields)
     return qr_fields, qr_confident
 
 
-def _scan_with_text(pdf_path, mode='balanced'):
+def _scan_with_text(file_path, mode='balanced'):
+    if not is_pdf_file(file_path):
+        return {
+            'is_text_based': False,
+            'text': '',
+            'score': 0,
+            'confident': False,
+            'low_confidence': True,
+            'trip_itinerary': False,
+        }
+
     max_pages = 1 if mode == 'fast' else 2
-    lines, is_text_based = extract_text_from_pdf(pdf_path, max_pages=max_pages)
+    lines, is_text_based = extract_text_from_pdf(file_path, max_pages=max_pages)
     text = '\n'.join(lines) if lines else ''
     score, strong_hits, _ = _scan_text_score(text)
     confident = len(strong_hits) >= 2 or score >= _SCAN_SCORE_CONFIDENT
@@ -705,9 +1079,9 @@ def _scan_with_text(pdf_path, mode='balanced'):
     }
 
 
-def _scan_with_light_ocr(pdf_path):
+def _scan_with_light_ocr(file_path):
     try:
-        lines = run_ocr(pdf_to_images(pdf_path, max_pages=1))
+        lines = run_ocr(document_to_images(file_path, max_pages=1))
     except Exception:
         lines = []
     text = '\n'.join(lines) if lines else ''
@@ -716,20 +1090,20 @@ def _scan_with_light_ocr(pdf_path):
     return {'score': score, 'confident': confident, 'trip_itinerary': _looks_like_trip_itinerary(text)}
 
 
-def _classify_pdf_kind(pdf_path, mode='balanced'):
-    qr_fields, qr_confident = _scan_with_qr(pdf_path, mode=mode)
+def _classify_document_kind(file_path, mode='balanced'):
+    qr_fields, qr_confident = _scan_with_qr(file_path, mode=mode)
     if qr_confident:
         return 'invoice'
 
-    text_result = _scan_with_text(pdf_path, mode=mode)
+    text_result = _scan_with_text(file_path, mode=mode)
     if text_result['trip_itinerary']:
         return 'trip_itinerary'
     if text_result['confident']:
         return 'invoice'
 
-    allow_light_ocr = mode != 'fast'
+    allow_light_ocr = mode != 'fast' or is_image_file(file_path)
     if allow_light_ocr and text_result['low_confidence']:
-        ocr_result = _scan_with_light_ocr(pdf_path)
+        ocr_result = _scan_with_light_ocr(file_path)
         if ocr_result['trip_itinerary']:
             return 'trip_itinerary'
         if ocr_result['confident']:
@@ -741,50 +1115,52 @@ def _classify_pdf_kind(pdf_path, mode='balanced'):
 
     return 'other'
 
-def _scan_one_pdf(args):
-    pdf_path, mode = args
-    return pdf_path, _classify_pdf_kind(pdf_path, mode=mode)
+def _scan_one_document(args):
+    file_path, mode = args
+    return file_path, _classify_document_kind(file_path, mode=mode)
 
 
 def scan_folder_for_invoices(folder_path, mode='balanced'):
-    """递归扫描目录，返回所有 PDF 中属于发票的路径列表"""
+    """递归扫描目录，返回所有支持格式中属于发票的路径列表"""
     if mode not in _SCAN_MODE_SET:
         mode = 'balanced'
 
-    pdf_paths = []
+    document_paths = []
     for root, dirs, files in os.walk(folder_path):
         dirs.sort()
         for fname in sorted(files):
-            if fname.lower().endswith('.pdf') and not fname.startswith('.'):
-                pdf_paths.append(os.path.join(root, fname))
+            if not fname.startswith('.') and is_supported_document(fname):
+                document_paths.append(os.path.join(root, fname))
 
     invoices = []
     trip_itineraries = []
     non_invoices = []
 
-    # fast 模式只做扫码+文本，允许并发以显著提速
-    if mode == 'fast' and pdf_paths:
-        workers = min(8, max(2, os.cpu_count() or 2))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for full_path, pdf_kind in ex.map(_scan_one_pdf, [(p, mode) for p in pdf_paths]):
-                if pdf_kind == 'invoice':
-                    invoices.append(full_path)
-                elif pdf_kind == 'trip_itinerary':
-                    trip_itineraries.append(full_path)
-                else:
-                    non_invoices.append(full_path)
-    else:
+    def add_classified_path(full_path, document_kind):
+        if document_kind == 'invoice':
+            invoices.append(full_path)
+        elif document_kind == 'trip_itinerary':
+            trip_itineraries.append(full_path)
+        else:
+            non_invoices.append(full_path)
+
+    # Keep scan classification sequential. PyMuPDF/OpenCV calls used by QR
+    # extraction can crash the whole Python process when run from threads on
+    # Windows, which makes Electron receive no JSON result from scan-folder.
+    if mode == 'fast' and document_paths:
+        pdf_paths = [p for p in document_paths if is_pdf_file(p)]
+        image_paths = [p for p in document_paths if is_image_file(p)]
         for full_path in pdf_paths:
-            pdf_kind = _classify_pdf_kind(full_path, mode=mode)
-            if pdf_kind == 'invoice':
-                invoices.append(full_path)
-            elif pdf_kind == 'trip_itinerary':
-                trip_itineraries.append(full_path)
-            else:
-                non_invoices.append(full_path)
+            add_classified_path(full_path, _classify_document_kind(full_path, mode=mode))
+        for full_path in image_paths:
+            add_classified_path(full_path, _classify_document_kind(full_path, mode=mode))
+    else:
+        for full_path in document_paths:
+            document_kind = _classify_document_kind(full_path, mode=mode)
+            add_classified_path(full_path, document_kind)
 
     return {
-        'total': len(pdf_paths),
+        'total': len(document_paths),
         'invoices': invoices,
         'trip_itineraries': trip_itineraries,
         'non_invoices': non_invoices,
@@ -811,14 +1187,7 @@ def main():
         return
 
     if len(sys.argv) >= 2 and sys.argv[1] == '--server':
-        # 常驻模式：预热 OCR 模型（只加载一次），然后循环处理请求
-        try:
-            get_ocr()
-        except Exception as e:
-            sys.stdout.write(json.dumps({'_init_error': str(e)}) + '\n')
-            sys.stdout.flush()
-            sys.exit(1)
-
+        # 常驻模式：先启动进程，按需懒加载 OCR 模型。这样 QR-only 发票不受 OCR 模型故障影响。
         sys.stdout.write(json.dumps({'_ready': True}) + '\n')
         sys.stdout.flush()
 
@@ -830,11 +1199,18 @@ def main():
             try:
                 req = json.loads(line)
                 req_id = req.get('id', '')
-                pdf_path = req.get('path', '')
-                if not os.path.exists(pdf_path):
-                    result = {'error': f'文件不存在: {pdf_path}'}
+                file_path = req.get('path', '')
+                if file_path == '__test__':
+                    get_ocr()
+                    result = {'ok': True}
+                elif not os.path.exists(file_path):
+                    result = {'error': f'文件不存在: {file_path}'}
                 else:
-                    result = process(pdf_path)
+                    result = process(
+                        file_path,
+                        deep_ocr=bool(req.get('deep_ocr')),
+                        enrich_image_seller=req.get('enrich_image_seller') is not False
+                    )
                 result['id'] = req_id
             except Exception as e:
                 result = {'id': req.get('id', ''), 'error': str(e)}

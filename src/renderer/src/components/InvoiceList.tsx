@@ -153,7 +153,7 @@ export default function InvoiceList(): React.JSX.Element {
         </svg>
         <div className="text-center">
           <p className="font-medium text-gray-500">暂无发票</p>
-          <p className="text-sm mt-1">点击顶部「导入发票」开始添加 PDF</p>
+          <p className="text-sm mt-1">点击顶部「导入发票」开始添加 PDF 或图片</p>
         </div>
       </div>
     )

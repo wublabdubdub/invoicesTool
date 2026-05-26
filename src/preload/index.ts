@@ -1,13 +1,26 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
 type ImportProgressPayload = {
-  phase: 'import' | 'ocr' | 'done'
+  phase: 'import' | 'ocr' | 'attachment' | 'done'
   done: number
   total: number
   imported: number
   skipped: number
   ocrProcessed: number
   ocrFailed: number
+}
+
+type DocumentData = {
+  base64: string
+  mimeType: string
+  extension: string
+}
+
+type BackgroundOcrStatusPayload = {
+  activeIds: string[]
+  completedId?: string
+  failedId?: string
+  error?: string
 }
 
 const api = {
@@ -64,7 +77,14 @@ const api = {
     }>
   }> => ipcRenderer.invoke('import-batch-files', invoicePaths, tripItineraryPaths, projectTag),
   cancelScan: (): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-scan'),
-  getPdfData: (filePath: string): Promise<string> => ipcRenderer.invoke('get-pdf-data', filePath),
+  getBackgroundOcrStatus: (): Promise<BackgroundOcrStatusPayload> =>
+    ipcRenderer.invoke('get-background-ocr-status'),
+  onBackgroundOcrStatus: (callback: (status: BackgroundOcrStatusPayload) => void): (() => void) => {
+    const listener = (_event: unknown, payload: BackgroundOcrStatusPayload): void => callback(payload)
+    ipcRenderer.on('background-ocr-status', listener)
+    return () => ipcRenderer.off('background-ocr-status', listener)
+  },
+  getPdfData: (filePath: string): Promise<DocumentData> => ipcRenderer.invoke('get-pdf-data', filePath),
   getInvoiceAttachments: (invoiceId: string) => ipcRenderer.invoke('get-invoice-attachments', invoiceId),
   importInvoiceAttachments: (
     invoiceId: string,
@@ -99,11 +119,15 @@ const api = {
     ipcRenderer.invoke('create-project', name, color),
   deleteProject: (id: string) => ipcRenderer.invoke('delete-project', id),
 
-  // 导出
-  exportReport: (filter: Record<string, unknown>, settings: Record<string, unknown>) =>
-    ipcRenderer.invoke('export-report', filter, settings),
-  exportZip: (filter: Record<string, unknown>, settings: Record<string, unknown>) =>
-    ipcRenderer.invoke('export-zip', filter, settings),
+  // 整理
+  organizeInvoiceFiles: (): Promise<{
+    success: boolean
+    path?: string
+    copied?: number
+    attachmentCopied?: number
+    skipped?: number
+    error?: string
+  }> => ipcRenderer.invoke('organize-invoice-files'),
 
   // 设置
   getSettings: (): Promise<Record<string, string>> => ipcRenderer.invoke('get-settings'),

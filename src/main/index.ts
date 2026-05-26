@@ -7,12 +7,12 @@ import {
   importInvoiceAttachments,
   getInvoiceAttachments,
   deleteInvoiceAttachment,
-  getPdfBase64,
+  getDocumentData,
   deletePdfFiles,
   ImportedItem
 } from './handlers/fileHandler'
 import { runOcr, scanFolder, setPythonPath, stopOcrProcess, cancelScanProcess } from './handlers/ocrHandler'
-import { exportReport, exportZip } from './handlers/exportHandler'
+import { organizeInvoiceFiles } from './handlers/organizeHandler'
 import { v4 as uuidv4 } from 'uuid'
 
 let mainWindow: BrowserWindow | null = null
@@ -24,12 +24,15 @@ function createWindow(): void {
     minWidth: 1000,
     minHeight: 700,
     titleBarStyle: 'hiddenInset',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false
     }
   })
+
+  mainWindow.setMenu(null)
 
   if (process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -102,6 +105,15 @@ type BatchImportResult = {
   unmatchedDetails: UnmatchedTripItineraryDetail[]
 }
 
+type BackgroundOcrStatusPayload = {
+  activeIds: string[]
+  completedId?: string
+  failedId?: string
+  error?: string
+}
+
+type BackgroundOcrItem = ImportedItem
+
 type SuggestedTaxiInvoice = {
   invoiceId: string
   vendor: string | null
@@ -130,6 +142,103 @@ type TaxiInvoiceCandidate = {
   preferred: boolean
 }
 
+const backgroundOcrQueue: BackgroundOcrItem[] = []
+const backgroundOcrIds = new Set<string>()
+let backgroundOcrRunning = false
+
+function isImagePath(filePath: string): boolean {
+  return ['.jpg', '.jpeg', '.png'].includes(path.extname(filePath).toLowerCase())
+}
+
+function getBackgroundOcrStatus(extra: Partial<BackgroundOcrStatusPayload> = {}): BackgroundOcrStatusPayload {
+  return {
+    activeIds: [...backgroundOcrIds],
+    ...extra
+  }
+}
+
+function emitBackgroundOcrStatus(extra: Partial<BackgroundOcrStatusPayload> = {}): void {
+  mainWindow?.webContents.send('background-ocr-status', getBackgroundOcrStatus(extra))
+}
+
+function applyOcrDataToInvoice(invoiceId: string, data: Record<string, unknown>): void {
+  const db = getDb()
+  const category = toNullableString(data.category) || '餐饮外卖'
+  const ocrRaw = JSON.stringify(data)
+
+  db.run(
+    `UPDATE invoices
+     SET invoice_no = ?,
+         date = ?,
+         vendor = ?,
+         vendor_tax_id = ?,
+         amount = ?,
+         tax = ?,
+         total = ?,
+         category = ?,
+         invoice_type = ?,
+         ocr_raw = ?
+     WHERE id = ?`,
+    [
+      toNullableString(data.invoice_no),
+      toNullableString(data.date),
+      toNullableString(data.vendor),
+      toNullableString(data.vendor_tax_id),
+      toNullableNumber(data.amount),
+      toNullableNumber(data.tax),
+      toNullableNumber(data.total),
+      category,
+      toNullableString(data.invoice_type),
+      ocrRaw,
+      invoiceId
+    ]
+  )
+}
+
+function enqueueBackgroundOcr(items: BackgroundOcrItem[]): void {
+  const nextItems = items.filter((item) => !backgroundOcrIds.has(item.id))
+  if (!nextItems.length) return
+
+  for (const item of nextItems) {
+    backgroundOcrQueue.push(item)
+    backgroundOcrIds.add(item.id)
+  }
+  emitBackgroundOcrStatus()
+  void runBackgroundOcrQueue()
+}
+
+async function runBackgroundOcrQueue(): Promise<void> {
+  if (backgroundOcrRunning) return
+  backgroundOcrRunning = true
+  const pythonPath = getConfiguredPythonPath()
+  setPythonPath(pythonPath)
+
+  while (backgroundOcrQueue.length > 0) {
+    const item = backgroundOcrQueue.shift()!
+    try {
+      const result = await runOcr(item.filePath, { deepOcr: true, timeoutMs: 180_000 })
+      if (result.success && result.data) {
+        applyOcrDataToInvoice(item.id, result.data)
+        saveDb()
+        backgroundOcrIds.delete(item.id)
+        emitBackgroundOcrStatus({ completedId: item.id })
+      } else {
+        backgroundOcrIds.delete(item.id)
+        emitBackgroundOcrStatus({ failedId: item.id, error: result.error })
+      }
+    } catch (err) {
+      backgroundOcrIds.delete(item.id)
+      emitBackgroundOcrStatus({
+        failedId: item.id,
+        error: err instanceof Error ? err.message : String(err)
+      })
+    }
+  }
+
+  backgroundOcrRunning = false
+  emitBackgroundOcrStatus()
+}
+
 async function autoOcrImportedItems(
   items: ImportedItem[],
   pythonPath: string,
@@ -138,13 +247,13 @@ async function autoOcrImportedItems(
   if (!items.length) return { ocrProcessed: 0, ocrFailed: 0 }
 
   setPythonPath(pythonPath)
-  const db = getDb()
   let ocrProcessed = 0
   let ocrFailed = 0
+  const backgroundItems: ImportedItem[] = []
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i]
-    const result = await runOcr(item.filePath)
+    const result = await runOcr(item.filePath, { deepOcr: false, enrichImageSeller: false })
     if (!result.success || !result.data) {
       ocrFailed++
       onProgress?.({ done: i + 1, total: items.length, ocrProcessed, ocrFailed })
@@ -158,41 +267,17 @@ async function autoOcrImportedItems(
     }
 
     const data = result.data
-    const category = toNullableString(data.category) || '餐饮外卖'
-    const ocrRaw = JSON.stringify(data)
-
-    db.run(
-      `UPDATE invoices
-       SET invoice_no = ?,
-           date = ?,
-           vendor = ?,
-           vendor_tax_id = ?,
-           amount = ?,
-           tax = ?,
-           total = ?,
-           category = ?,
-           invoice_type = ?,
-           ocr_raw = ?
-       WHERE id = ?`,
-      [
-        toNullableString(data.invoice_no),
-        toNullableString(data.date),
-        toNullableString(data.vendor),
-        toNullableString(data.vendor_tax_id),
-        toNullableNumber(data.amount),
-        toNullableNumber(data.tax),
-        toNullableNumber(data.total),
-        category,
-        toNullableString(data.invoice_type),
-        ocrRaw,
-        item.id
-      ]
-    )
+    applyOcrDataToInvoice(item.id, data)
+    const source = toNullableString(data._source) || ''
+    if (source.includes('ocr_skipped') || isImagePath(item.filePath)) {
+      backgroundItems.push(item)
+    }
     ocrProcessed++
     onProgress?.({ done: i + 1, total: items.length, ocrProcessed, ocrFailed })
   }
 
   if (ocrProcessed > 0) saveDb()
+  enqueueBackgroundOcr(backgroundItems)
   return { ocrProcessed, ocrFailed }
 }
 
@@ -401,7 +486,7 @@ async function autoImportTripItineraries(
   for (let i = 0; i < paths.length; i++) {
     const filePath = paths[i]
     try {
-      const result = await runOcr(filePath)
+      const result = await runOcr(filePath, { deepOcr: true, timeoutMs: 180_000 })
       if (!result.success || !result.data) {
         attachmentFailed++
         onProgress?.({
@@ -559,7 +644,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle('select-pdf-files', async () => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile', 'multiSelections'],
-      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+      filters: [
+        { name: '发票文件', extensions: ['pdf', 'jpg', 'jpeg', 'png'] },
+        { name: 'PDF', extensions: ['pdf'] },
+        { name: '图片', extensions: ['jpg', 'jpeg', 'png'] }
+      ]
     })
     return result.filePaths
   })
@@ -630,7 +719,7 @@ function registerIpcHandlers(): void {
   )
 
   ipcMain.handle('get-pdf-data', (_event, filePath: string) => {
-    return getPdfBase64(filePath)
+    return getDocumentData(filePath)
   })
 
   ipcMain.handle('get-invoice-attachments', (_event, invoiceId: string) => {
@@ -759,11 +848,12 @@ function registerIpcHandlers(): void {
     cancelScanProcess()
     return { success: true }
   })
+  ipcMain.handle('get-background-ocr-status', () => getBackgroundOcrStatus())
 
   // OCR
   ipcMain.handle('run-ocr', async (_event, filePath: string) => {
     const pythonPath = getConfiguredPythonPath()
-    return runOcr(filePath, pythonPath)
+    return runOcr(filePath, pythonPath, { deepOcr: true, timeoutMs: 180_000 })
   })
 
   // Projects
@@ -789,13 +879,9 @@ function registerIpcHandlers(): void {
     return { success: true }
   })
 
-  // Export
-  ipcMain.handle('export-report', async (_event, filter, settings) => {
-    return exportReport(filter, settings)
-  })
-
-  ipcMain.handle('export-zip', async (_event, filter, settings) => {
-    return exportZip(filter, settings)
+  // Organize
+  ipcMain.handle('organize-invoice-files', async () => {
+    return organizeInvoiceFiles()
   })
 
   // Settings

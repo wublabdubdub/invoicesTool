@@ -74,16 +74,7 @@ export interface OcrResult {
   invoice_type: InvoiceType | null
 }
 
-export interface ReportFilter {
-  startDate?: string
-  endDate?: string
-  projectTag?: string
-  categories?: InvoiceCategory[]
-}
-
 export interface AppSettings {
   pythonPath: string
   dataDir: string
-  exporterName: string
-  companyName: string
 }
